@@ -549,8 +549,63 @@ if not st.session_state['file_uploaded']:
 else:
     excel_file = st.session_state['excel_file']
 
-df = pd.read_excel(excel_file)
-df = df.loc[:, ~df.columns.duplicated()]
+# --- NEW: compatibility shim for the updated Excel format (no logic changes elsewhere) ---
+import pandas as _pd
+
+# 1) Read and fix duplicate "Name" -> the second one becomes "Name2"
+_df_raw = _pd.read_excel(excel_file, sheet_name=0)
+
+# If there are multiple "Name" columns, rename the second to "Name2"
+_name_cols = list(map(str, _df_raw.columns))
+if _name_cols.count("Name") > 1 and "Name2" not in _df_raw.columns:
+    first_idx = _name_cols.index("Name")
+    try:
+        second_idx = first_idx + 1 + _name_cols[first_idx + 1:].index("Name")
+        _name_cols[second_idx] = "Name2"
+        _df_raw.columns = _name_cols
+    except ValueError:
+        pass  # if we somehow don't find a second "Name", do nothing
+
+# 2) Normalize header whitespace (trim) and unify minor naming differences
+_df_raw.rename(columns=lambda x: str(x).strip(), inplace=True)
+
+# Map new headers -> the exact headers your app already uses
+_header_map = {
+    # Team field (same key, keep normalized)
+    "NISSAN-BIW Team's": "NISSAN-BIW Team's",
+
+    # Small trailing-space variance
+    "Datum / Production ID creation": "Datum / Production ID creation",
+    "Datum / Production ID creation ": "Datum / Production ID creation",
+
+    # IWS / QAR section: case/wording alignments
+    "Weld Inspection camera": "Weld Inspection Camera",
+    "Weld Inspection Camera": "Weld Inspection Camera",
+    "Weld check area": "Weld Check Area",
+
+    # General skills: wording/case updates to match GENERAL_SKILLS
+    "New Skill up for Future Business Shift": "New Skill up for future business shift",
+    "TQM (Total Quality Management)": "TQM",
+    "Japanese Training": "Japanese training",
+    "Strategical Planning": "Strategical planning",
+
+    # Already matching, included for safety re: stray spaces/case
+    "Digitalization": "Digitalization",
+    "Automation": "Automation",
+    "Documentation & Presentation": "Documentation & Presentation",
+}
+
+_df_raw.rename(columns=_header_map, inplace=True)
+
+# 3) Drop the giant "Upload Your Filled PPT..." column (name can include line breaks)
+for _c in list(_df_raw.columns):
+    if "Upload Your Filled PPT" in str(_c):
+        _df_raw.drop(columns=[_c], inplace=True, errors="ignore")
+        break
+
+# 4) Your original de-duplication, unchanged
+df = _df_raw.loc[:, ~_df_raw.columns.duplicated()]
+# --- END shim ---
 
 def assign_block(row):
     team_val = norm_team_name(row.get("NISSAN-BIW Team's", ""))
@@ -1868,4 +1923,3 @@ def plot_big_planet_stacked_bar_chart(data, categories, planets, title="Big Plan
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
