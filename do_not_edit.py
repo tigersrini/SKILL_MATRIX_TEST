@@ -549,10 +549,11 @@ if not st.session_state['file_uploaded']:
 else:
     excel_file = st.session_state['excel_file']
 
-# --- NEW: compatibility shim for the updated Excel format (no logic changes elsewhere) ---
-import pandas as _pd
+# --- NEW: robust Excel compatibility + skill header harmonization (no downstream logic changes) ---
+import pandas as _pd, re as _re, unicodedata as _ud
+from difflib import SequenceMatcher as _SM
 
-# 1) Read and fix duplicate "Name" -> the second one becomes "Name2"
+# 1) Read and fix duplicate "Name" -> second one becomes "Name2"
 _df_raw = _pd.read_excel(excel_file, sheet_name=0)
 
 # If there are multiple "Name" columns, rename the second to "Name2"
@@ -564,38 +565,10 @@ if _name_cols.count("Name") > 1 and "Name2" not in _df_raw.columns:
         _name_cols[second_idx] = "Name2"
         _df_raw.columns = _name_cols
     except ValueError:
-        pass  # if we somehow don't find a second "Name", do nothing
+        pass  # no second "Name"? ignore
 
-# 2) Normalize header whitespace (trim) and unify minor naming differences
+# 2) Normalize header whitespace/case (trim only; keep original text where possible)
 _df_raw.rename(columns=lambda x: str(x).strip(), inplace=True)
-
-# Map new headers -> the exact headers your app already uses
-_header_map = {
-    # Team field (same key, keep normalized)
-    "NISSAN-BIW Team's": "NISSAN-BIW Team's",
-
-    # Small trailing-space variance
-    "Datum / Production ID creation": "Datum / Production ID creation",
-    "Datum / Production ID creation ": "Datum / Production ID creation",
-
-    # IWS / QAR section: case/wording alignments
-    "Weld Inspection camera": "Weld Inspection Camera",
-    "Weld Inspection Camera": "Weld Inspection Camera",
-    "Weld check area": "Weld Check Area",
-
-    # General skills: wording/case updates to match GENERAL_SKILLS
-    "New Skill up for Future Business Shift": "New Skill up for future business shift",
-    "TQM (Total Quality Management)": "TQM",
-    "Japanese Training": "Japanese training",
-    "Strategical Planning": "Strategical planning",
-
-    # Already matching, included for safety re: stray spaces/case
-    "Digitalization": "Digitalization",
-    "Automation": "Automation",
-    "Documentation & Presentation": "Documentation & Presentation",
-}
-
-_df_raw.rename(columns=_header_map, inplace=True)
 
 # 3) Drop the giant "Upload Your Filled PPT..." column (name can include line breaks)
 for _c in list(_df_raw.columns):
@@ -603,8 +576,132 @@ for _c in list(_df_raw.columns):
         _df_raw.drop(columns=[_c], inplace=True, errors="ignore")
         break
 
-# 4) Your original de-duplication, unchanged
-df = _df_raw.loc[:, ~_df_raw.columns.duplicated()]
+# 4) Safety de-dup like your original line
+_df_raw = _df_raw.loc[:, ~_df_raw.columns.duplicated()]
+
+# ===== Skill header harmonization =====
+# Goal: ensure all keys used by TEAM_BLOCKS + GENERAL_SKILLS exist in df.columns.
+# Strategy:
+#   - exact match
+#   - alias map for known wording/case diffs
+#   - normalized exact match (strip spaces/punct/case)
+#   - fuzzy best-match fallback (>= 0.78 similarity)
+
+def _norm(s: str) -> str:
+    if s is None: return ""
+    s = str(s)
+    # normalize unicode spaces
+    s = "".join(" " if _ud.category(ch) == "Zs" else ch for ch in s)
+    # lowercase
+    s = s.lower()
+    # standardize "&" and "and"
+    s = s.replace("&", " and ")
+    # collapse spaces
+    s = _re.sub(r"\s+", " ", s).strip()
+    # remove non-alnum except spaces
+    s = _re.sub(r"[^a-z0-9 ]", "", s)
+    # remove spaces to be robust
+    s = s.replace(" ", "")
+    return s
+
+# Build expected skills from your app config already in memory
+_expected_skills = set()
+for _team, _skills in TEAM_BLOCKS.items():
+    _expected_skills.update(_skills)
+_expected_skills.update(GENERAL_SKILLS)
+_expected_skills = list(_expected_skills)
+
+# Known aliases from the new sheet to your app's canonical keys
+_alias_map = {
+    # Subtle spacing/case variants seen in the uploaded xlsx
+    "Datum / Production ID creation ": "Datum / Production ID creation",
+    "Weld Inspection camera": "Weld Inspection Camera",
+    "Weld inspection camera": "Weld Inspection Camera",
+    "Weld check area": "Weld Check Area",  # your app uses title case
+    "New Skill up for Future Business Shift": "New Skill up for future business shift",
+    "TQM (Total Quality Management)": "TQM",
+    "Japanese Training": "Japanese training",
+    "Strategical Planning": "Strategical planning",
+    # Safety: already matching but guard stray spaces/case
+    "Digitalization": "Digitalization",
+    "Automation": "Automation",
+    "Documentation & Presentation": "Documentation & Presentation",
+}
+
+# 1) Start with direct alias renames if those columns exist
+for _src, _dst in _alias_map.items():
+    if _src in _df_raw.columns and _dst not in _df_raw.columns:
+        _df_raw.rename(columns={_src: _dst}, inplace=True)
+
+# Build lookup structures
+_excel_cols = list(map(str, _df_raw.columns))
+_norm_to_excel = {}
+for c in _excel_cols:
+    _norm_to_excel.setdefault(_norm(c), c)  # first occurrence wins
+
+# Try to ensure every expected skill exists as a column in df by copying from best match
+_created = {}      # expected_skill -> matched_excel_col
+_unmatched = []    # expected_skills with no source
+
+def _best_fuzzy_match(target: str, candidates: list[str]) -> tuple[str, float]:
+    best_c, best_s = None, 0.0
+    for c in candidates:
+        s = _SM(None, target, c).ratio()
+        if s > best_s:
+            best_c, best_s = c, s
+    return best_c, best_s
+
+for exp in _expected_skills:
+    if exp in _df_raw.columns:
+        _created[exp] = exp
+        continue
+
+    # alias reverse: if any alias maps to this expected key and exists, copy
+    _rev_alias_sources = [k for k, v in _alias_map.items() if v == exp and k in _df_raw.columns]
+    if _rev_alias_sources:
+        _df_raw[exp] = _df_raw[_rev_alias_sources[0]]
+        _created[exp] = _rev_alias_sources[0]
+        continue
+
+    # normalized exact
+    exp_n = _norm(exp)
+    if exp_n in _norm_to_excel and _norm_to_excel[exp_n] not in _df_raw.columns:
+        _df_raw[exp] = _df_raw[_norm_to_excel[exp_n]]
+        _created[exp] = _norm_to_excel[exp_n]
+        continue
+    elif exp_n in _norm_to_excel and _norm_to_excel[exp_n] == exp:
+        _created[exp] = exp
+        continue
+
+    # fuzzy fallback among skill-ish columns only (heuristic: ignore metadata columns)
+    # Build a pool: columns that aren't obvious metadata
+    _maybe_skill_cols = [c for c in _excel_cols if c not in ["ID", "Start time", "Completion time", "Email", "Name", "Name2",
+                                                             "Last modified time", "IPN (NTB-ID)", "Date of Joining", "Designation", "NISSAN-BIW Team's"]
+                         and "upload" not in c.lower()]
+    best_col, score = _best_fuzzy_match(_norm(exp), [_norm(c) for c in _maybe_skill_cols])
+    if best_col is not None and score >= 0.78:
+        # 'best_col' is normalized; map back to the original excel col via norm lookup
+        original = _norm_to_excel.get(best_col, None)
+        if original is not None:
+            _df_raw[exp] = _df_raw[original]
+            _created[exp] = original
+            continue
+
+    # give up: create empty column so downstream radar doesn't crash, but mark unmatched
+    _df_raw[exp] = _pd.NA
+    _unmatched.append(exp)
+
+# Expose a quick debug panel inside the app (optional but very useful)
+with st.expander("🧩 Skill header mapping (Excel → App)", expanded=False):
+    _map_rows = [{"App Skill (expected)": k, "Excel Column Used": v} for k, v in sorted(_created.items(), key=lambda x: x[0].lower())]
+    if _map_rows:
+        st.dataframe(_pd.DataFrame(_map_rows))
+    if _unmatched:
+        st.warning("Some skills were not found in the Excel. They will show as blanks (PX=0).")
+        st.write(", ".join(sorted(_unmatched)))
+
+# 5) hand back as 'df' like your original code expects
+df = _df_raw
 # --- END shim ---
 
 def assign_block(row):
