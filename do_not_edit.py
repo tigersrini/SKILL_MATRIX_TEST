@@ -974,7 +974,7 @@ with tab1:
             showlegend=True,
             legend=dict(font=dict(size=20)),
             title=dict(text=f"{radar_trigger} Activity Strength Radar", font=dict(size=22)),
-            width=200,
+            width=700,
             height=700,
             margin=dict(l=60, r=100, t=60, b=60),
             transition={'duration': 1500, 'easing': 'cubic-in-out'},
@@ -1069,9 +1069,9 @@ with tab1:
                     direction="clockwise"
                 )
             ),
-        showlegend=True,
-        legend=dict(font=dict(size=20)),
-        title=dict(text=f"{radar_trigger} Members Strength Radar", font=dict(size=20)),
+            showlegend=True,
+            legend=dict(font=dict(size=20)),
+            title=dict(text=f"{radar_trigger} Members Strength Radar", font=dict(size=20)),
             width=700,
             height=600,
             margin=dict(l=60, r=60, t=60, b=60),
